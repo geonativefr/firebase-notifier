@@ -1,0 +1,327 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5b5417f..a23166d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,12 @@
+ CHANGELOG
+ =========
+ 
++7.2
++---
++
++* The legacy api has been replaced with HTTP v1
++* Add `useTopic` field to options
++
+ 5.3
+ ---
+ 
+diff --git a/FirebaseOptions.php b/FirebaseOptions.php
+index b37c2b8..b359663 100644
+--- a/FirebaseOptions.php
++++ b/FirebaseOptions.php
+@@ -20,7 +20,7 @@ use Symfony\Component\Notifier\Message\MessageOptionsInterface;
+  */
+ abstract class FirebaseOptions implements MessageOptionsInterface
+ {
+-    private string $to;
++    private string $tokenOrTopic;
+ 
+     /**
+      * @see https://firebase.google.com/docs/cloud-messaging/xmpp-server-ref.html#notification-payload-support
+@@ -29,17 +29,20 @@ abstract class FirebaseOptions implements MessageOptionsInterface
+ 
+     private array $data;
+ 
+-    public function __construct(string $to, array $options, array $data = [])
++    private bool $useTopic;
++
++    public function __construct(string $tokenOrTopic, array $options, array $data = [], bool $useTopic = false)
+     {
+-        $this->to = $to;
++        $this->tokenOrTopic = $tokenOrTopic;
+         $this->options = $options;
+         $this->data = $data;
++        $this->useTopic = $useTopic;
+     }
+ 
+     public function toArray(): array
+     {
+         return [
+-            'to' => $this->to,
++            ($this->useTopic ? 'topic' : 'token') => $this->tokenOrTopic,
+             'notification' => $this->options,
+             'data' => $this->data,
+         ];
+@@ -47,7 +50,7 @@ abstract class FirebaseOptions implements MessageOptionsInterface
+ 
+     public function getRecipientId(): ?string
+     {
+-        return $this->to;
++        return $this->tokenOrTopic;
+     }
+ 
+     /**
+diff --git a/FirebaseTransport.php b/FirebaseTransport.php
+index 4f6419b..242a4f8 100644
+--- a/FirebaseTransport.php
++++ b/FirebaseTransport.php
+@@ -24,17 +24,19 @@ use Symfony\Contracts\HttpClient\HttpClientInterface;
+ 
+ /**
+  * @author Jeroen Spee <https://github.com/Jeroeny>
++ * @author Cesur APAYDIN <https://github.com/cesurapp>
+  */
+ final class FirebaseTransport extends AbstractTransport
+ {
+-    protected const HOST = 'fcm.googleapis.com/fcm/send';
++    protected const HOST = 'fcm.googleapis.com/v1/projects/project_id/messages:send';
+ 
+-    private string $token;
++    private array $credentials;
+ 
+-    public function __construct(#[\SensitiveParameter] string $token, ?HttpClientInterface $client = null, ?EventDispatcherInterface $dispatcher = null)
++    public function __construct(#[\SensitiveParameter] array $credentials, HttpClientInterface $client = null, EventDispatcherInterface $dispatcher = null)
+     {
+-        $this->token = $token;
++        $this->credentials = $credentials;
+         $this->client = $client;
++        $this->setHost(str_replace('project_id', $credentials['project_id'], $this->getDefaultHost()));
+ 
+         parent::__construct($client, $dispatcher);
+     }
+@@ -56,20 +58,19 @@ final class FirebaseTransport extends AbstractTransport
+         }
+ 
+         $endpoint = sprintf('https://%s', $this->getEndpoint());
+-        $options = $message->getOptions()?->toArray() ?? [];
+-        $options['to'] = $message->getRecipientId();
+ 
+-        if (!$options['to']) {
+-            throw new InvalidArgumentException(sprintf('The "%s" transport required the "to" option to be set.', __CLASS__));
++        // Generate Options
++        $options = $message->getOptions()?->toArray() ?? [];
++        if (!$options['token'] && !$options['topic']) {
++            throw new InvalidArgumentException(sprintf('The "%s" transport required the "token" or "topic" option to be set.', __CLASS__));
+         }
+         $options['notification']['body'] = $message->getSubject();
+         $options['data'] ??= [];
+ 
++        // Send
+         $response = $this->client->request('POST', $endpoint, [
+-            'headers' => [
+-                'Authorization' => sprintf('key=%s', $this->token),
+-            ],
+-            'json' => array_filter($options),
++            'headers' => ['Authorization' => sprintf('key=%s', $this->getJwtToken()),],
++            'json' => array_filter(['message' => $options]),
+         ]);
+ 
+         try {
+@@ -89,14 +90,51 @@ final class FirebaseTransport extends AbstractTransport
+         }
+ 
+         if (null !== $errorMessage) {
+-            throw new TransportException('Unable to post the Firebase message: '.$errorMessage, $response);
++            throw new TransportException('Unable to post the Firebase message: ' . $errorMessage, $response);
+         }
+ 
+         $success = $response->toArray(false);
+ 
+-        $sentMessage = new SentMessage($message, (string) $this);
++        $sentMessage = new SentMessage($message, (string)$this);
+         $sentMessage->setMessageId($success['results'][0]['message_id'] ?? '');
+ 
+         return $sentMessage;
+     }
+-}
++
++    private function getJwtToken(): string
++    {
++        $time = time();
++        $payload = [
++            'iss' => $this->credentials['client_email'],
++            'sub' => $this->credentials['client_email'],
++            'aud' => 'https://fcm.googleapis.com/',
++            'iat' => $time,
++            'exp' => $time + 3600,
++            'kid' => $this->credentials['private_key_id'],
++        ];
++
++        $header = $this->urlSafeEncode(['alg' => 'RS256', 'typ' => 'JWT']);
++        $payload = $this->urlSafeEncode($payload);
++        openssl_sign($header . '.' . $payload, $signature, openssl_pkey_get_private($this->encodePk($this->credentials['private_key'])), OPENSSL_ALGO_SHA256);
++        $signature = $this->urlSafeEncode($signature);
++
++        return $header . '.' . $payload . '.' . $signature;
++    }
++
++    protected function urlSafeEncode(string|array $data): string
++    {
++        if (is_array($data)) {
++            $data = json_encode($data, JSON_UNESCAPED_SLASHES);
++        }
++
++        return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
++    }
++
++    protected function encodePk(string $privateKey): string
++    {
++        $text = explode('-----', $privateKey);
++        $text[2] = str_replace(['\n', '_', ' '], ["\n", "\n", '+'], $text[2]);
++
++        return implode('-----', $text);
++    }
++}
+\ No newline at end of file
+diff --git a/FirebaseTransportFactory.php b/FirebaseTransportFactory.php
+index 808d747..4d150ea 100644
+--- a/FirebaseTransportFactory.php
++++ b/FirebaseTransportFactory.php
+@@ -11,6 +11,7 @@
+ 
+ namespace Symfony\Component\Notifier\Bridge\Firebase;
+ 
++use Symfony\Component\Notifier\Exception\MissingRequiredOptionException;
+ use Symfony\Component\Notifier\Exception\UnsupportedSchemeException;
+ use Symfony\Component\Notifier\Transport\AbstractTransportFactory;
+ use Symfony\Component\Notifier\Transport\Dsn;
+@@ -28,11 +29,17 @@ final class FirebaseTransportFactory extends AbstractTransportFactory
+             throw new UnsupportedSchemeException($dsn, 'firebase', $this->getSupportedSchemes());
+         }
+ 
+-        $token = sprintf('%s:%s', $this->getUser($dsn), $this->getPassword($dsn));
+-        $host = 'default' === $dsn->getHost() ? null : $dsn->getHost();
+-        $port = $dsn->getPort();
++        $credentials = [
++            'client_email' => sprintf('%s@%s', $dsn->getUser(), $dsn->getHost()),
++            ...$dsn->getOptions()
++        ];
+ 
+-        return (new FirebaseTransport($token, $this->client, $this->dispatcher))->setHost($host)->setPort($port);
++        $requiredParameters = array_diff(array_keys($credentials), ['client_email', 'project_id', 'private_key_id', 'private_key']);
++        if ($requiredParameters) {
++            throw new MissingRequiredOptionException(implode(', ', $requiredParameters));
++        }
++
++        return (new FirebaseTransport($credentials, $this->client, $this->dispatcher));
+     }
+ 
+     protected function getSupportedSchemes(): array
+diff --git a/README.md b/README.md
+index 7ff2c71..d248d42 100644
+--- a/README.md
++++ b/README.md
+@@ -3,16 +3,25 @@ Firebase Notifier
+ 
+ Provides [Firebase](https://firebase.google.com) integration for Symfony Notifier.
+ 
+-DSN example
++JWT DSN Example (HTTP v1)
+ -----------
+ 
+ ```
+-FIREBASE_DSN=firebase://USERNAME:PASSWORD@default
++FIREBASE_DSN=firebase://<CLIENT_EMAIL>?project_id=<PROJECT_ID>&private_key_id=<PRIVATE_KEY_ID>&private_key=<PRIVATE_KEY>
++FIREBASE_DSN=firebase://firebase-adminsdk@stag.iam.gserviceaccount.com?project_id=<PROJECT_ID>&private_key_id=<PRIVATE_KEY_ID>&private_key=<PRIVATE_KEY>
+ ```
+ 
+-where:
+- - `USERNAME` is your Firebase username
+- - `PASSWORD` is your Firebase password
++Since __"private_key"__ is long, you must write it in a single line with "\n". Example:
++```
++-----BEGIN RSA PRIVATE KEY-----\n.....\n....\n-----END RSA PRIVATE KEY-----
++```
++
++__Required Options:__
++* client_email
++* project_id
++* private_key_id
++* private_key
++
+ 
+ Adding Interactions to a Message
+ --------------------------------
+@@ -27,7 +36,7 @@ use Symfony\Component\Notifier\Bridge\Firebase\Notification\AndroidNotification;
+ $chatMessage = new ChatMessage('');
+ 
+ // Create AndroidNotification options
+-$androidOptions = (new AndroidNotification('/topics/news', []))
++$androidOptions = (new AndroidNotification('/topics/news', [], [], true))
+     ->icon('myicon')
+     ->sound('default')
+     ->tag('myNotificationId')
+diff --git a/Tests/FirebaseTransportFactoryTest.php b/Tests/FirebaseTransportFactoryTest.php
+index ed67b6e..36d8f0f 100644
+--- a/Tests/FirebaseTransportFactoryTest.php
++++ b/Tests/FirebaseTransportFactoryTest.php
+@@ -27,19 +27,19 @@ final class FirebaseTransportFactoryTest extends TransportFactoryTestCase
+     public static function createProvider(): iterable
+     {
+         yield [
+-            'firebase://host.test',
+-            'firebase://username:password@host.test',
++            'firebase://fcm.googleapis.com/v1/projects/<PROJECT_ID>/messages:send',
++            'firebase://firebase-adminsdk@stag.iam.gserviceaccount.com?project_id=<PROJECT_ID>&private_key_id=<PRIVATE_KEY_ID>&private_key=<PRIVATE_KEY>',
+         ];
+     }
+ 
+     public static function supportsProvider(): iterable
+     {
+-        yield [true, 'firebase://username:password@default'];
+-        yield [false, 'somethingElse://username:password@default'];
++        yield [true, 'firebase://client_email?project_id=1'];
++        yield [false, 'somethingElse://client_email?project_id=1'];
+     }
+ 
+     public static function unsupportedSchemeProvider(): iterable
+     {
+-        yield ['somethingElse://username:password@default'];
++        yield ['somethingElse://client_email'];
+     }
+ }
+diff --git a/Tests/FirebaseTransportTest.php b/Tests/FirebaseTransportTest.php
+index 704e9b9..a3b627c 100644
+--- a/Tests/FirebaseTransportTest.php
++++ b/Tests/FirebaseTransportTest.php
+@@ -30,12 +30,17 @@ final class FirebaseTransportTest extends TransportTestCase
+ {
+     public static function createTransport(?HttpClientInterface $client = null): FirebaseTransport
+     {
+-        return new FirebaseTransport('username:password', $client ?? new MockHttpClient());
++        return new FirebaseTransport([
++            'client_email' => 'firebase-adminsdk-test@test.iam.gserviceaccount.com',
++            'project_id' => 'test_project',
++            'private_key_id' => 'sdas7d6a8ds6ds78a',
++            'private_key' => "-----BEGIN RSA PRIVATE KEY-----\nMIICWwIBAAKBgGN4fgq4BFQwjK7kzWUYSFE1ryGIBtUScY5TqLY2BAROBnZS+SIa\nH4VcZJStPUwjtsVxJTf57slhMM5FbAOQkWFMmRlHGWc7EZy6UMMvP8FD21X3Ty9e\nZzJ/Be30la1Uy7rechBh3RN+Y3rSKV+gDmsjdo5/4Jekj4LfluDXbwVJAgMBAAEC\ngYA5SqY2IEUGBKyS81/F8ZV9iNElHAbrZGMZWeAbisMHg7U/I40w8iDjnBKme52J\npCxaTk/kjMTXIm6M7/lFmFfTHgl5WLCimu2glMyKFM2GBYX/cKx9RnI36q3uJYml\n1G1f2H7ALurisenEqMaq8bdyApd/XNqcijogfsZ1K/irTQJBAKEQFkqNDgwUgAwr\njhG/zppl5yEJtP+Pncp/2t/s6khk0q8N92xw6xl8OV/ww+rwlJB3IKVKw903LztQ\nP1D3zpMCQQCeGlOvMx9XxiktNIkdXekGP/bFUR9/u0ABaYl9valZ2B3yZzujJJHV\n0EtyKGorT39wWhWY7BI8NTYgivCIWGozAkEAhMnOlwhUXIFKUL5YEyogHAuH0yU9\npLWzUhC3U4bwYV8+lDTfmPg/3HMemorV/Az9b13H/H73nJqyxiQTD54/IQJAZUX/\n7O4WWac5oRdR7VnGdpZqgCJixvMvILh1tfHTlRV2uVufO/Wk5Q00BsAUogGeZF2Q\nEBDH7YE4VsgpI21fOQJAJdSB7mHvStlYCQMEAYWCWjk+NRW8fzZCkQkqzOV6b9dw\nDFp6wp8aLw87hAHUz5zXTCRYi/BpvDhfP6DDT2sOaw==\n-----END RSA PRIVATE KEY-----"
++        ], $client ?? new MockHttpClient());
+     }
+ 
+     public static function toStringProvider(): iterable
+     {
+-        yield ['firebase://fcm.googleapis.com/fcm/send', self::createTransport()];
++        yield ['firebase://fcm.googleapis.com/v1/projects/test_project/messages:send', self::createTransport()];
+     }
+ 
+     public static function supportedMessagesProvider(): iterable
+@@ -56,7 +61,7 @@ final class FirebaseTransportTest extends TransportTestCase
+     {
+         $this->expectException(TransportException::class);
+ 
+-        $client = new MockHttpClient(static fn (): ResponseInterface => $response);
++        $client = new MockHttpClient(static fn(): ResponseInterface => $response);
+         $options = new class('recipient-id', []) extends FirebaseOptions {};
+ 
+         $transport = self::createTransport($client);
+diff --git a/composer.json b/composer.json
+index 2f3a4a7..32e5afe 100644
+--- a/composer.json
++++ b/composer.json
+@@ -17,6 +17,7 @@
+     ],
+     "require": {
+         "php": ">=8.1",
++        "ext-openssl": "*",
+         "symfony/http-client": "^5.4|^6.0|^7.0",
+         "symfony/notifier": "^6.2.7|^7.0"
+     },
