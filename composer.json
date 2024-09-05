@@ -1,5 +1,5 @@
 {
-    "name": "symfony/firebase-notifier",
+    "name": "geonative/firebase-notifier",
     "type": "symfony-notifier-bridge",
     "description": "Symfony Firebase Notifier Bridge",
     "keywords": ["firebase", "notifier"],
