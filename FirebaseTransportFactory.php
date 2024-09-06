@@ -24,7 +24,6 @@ final class FirebaseTransportFactory extends AbstractTransportFactory
     public function create(Dsn $dsn): FirebaseTransport
     {
         $scheme = $dsn->getScheme();
-
         if ('firebase' !== $scheme) {
             throw new UnsupportedSchemeException($dsn, 'firebase', $this->getSupportedSchemes());
         }
@@ -33,6 +32,10 @@ final class FirebaseTransportFactory extends AbstractTransportFactory
             'client_email' => sprintf('%s@%s', $dsn->getUser(), $dsn->getHost()),
             ...$dsn->getOptions()
         ];
+
+        // Retrieve the original DSN to get the private key
+        $originalDsn = $dsn->getOriginalDsn();
+        $credentials['private_key'] = explode("&", explode("private_key=", $originalDsn)[1])[0];
 
         $requiredParameters = array_diff(
             array_keys($credentials),
