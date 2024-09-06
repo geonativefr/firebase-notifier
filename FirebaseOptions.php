@@ -27,15 +27,12 @@ abstract class FirebaseOptions implements MessageOptionsInterface
      */
     protected $options;
 
-    private array $data;
-
     private bool $useTopic;
 
-    public function __construct(string $tokenOrTopic, array $options, array $data = [], bool $useTopic = false)
+    public function __construct(string $tokenOrTopic, array $options, bool $useTopic = false)
     {
         $this->tokenOrTopic = $tokenOrTopic;
         $this->options = $options;
-        $this->data = $data;
         $this->useTopic = $useTopic;
     }
 
@@ -43,8 +40,7 @@ abstract class FirebaseOptions implements MessageOptionsInterface
     {
         return [
             ($this->useTopic ? 'topic' : 'token') => $this->tokenOrTopic,
-            'notification' => $this->options,
-            'data' => $this->data,
+            ...$this->options
         ];
     }
 
@@ -69,16 +65,6 @@ abstract class FirebaseOptions implements MessageOptionsInterface
     public function body(string $body): static
     {
         $this->options['body'] = $body;
-
-        return $this;
-    }
-
-    /**
-     * @return $this
-     */
-    public function data(array $data): static
-    {
-        $this->data = $data;
 
         return $this;
     }

@@ -76,16 +76,11 @@ final class FirebaseTransport extends AbstractTransport
         }
         $options['notification']['body'] = $message->getSubject();
 
-        // Remove wrong options
-        unset($options['data']);
-
         // Send
         $response = $this->client->request('POST', $endpoint, [
             'headers' => ['Authorization' => 'Bearer ' . $this->getAccessToken()],
             'json' => array_filter(['message' => $options]),
         ]);
-        dump($endpoint, $options);
-        dump($response->getStatusCode());
 
         try {
             $statusCode = $response->getStatusCode();
