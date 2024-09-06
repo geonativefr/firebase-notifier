@@ -11,6 +11,9 @@
 
 namespace Symfony\Component\Notifier\Bridge\Firebase;
 
+use Google\Client;
+use Symfony\Component\Cache\Adapter\FilesystemAdapter;
+use Symfony\Component\Cache\CacheItem;
 use Symfony\Component\Notifier\Exception\InvalidArgumentException;
 use Symfony\Component\Notifier\Exception\TransportException;
 use Symfony\Component\Notifier\Exception\UnsupportedMessageTypeException;
@@ -21,6 +24,8 @@ use Symfony\Component\Notifier\Transport\AbstractTransport;
 use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
 use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
+use Symfony\Component\Cache\Adapter\AdapterInterface;
+use DateTimeImmutable;
 
 /**
  * @author Jeroen Spee <https://github.com/Jeroeny>
@@ -32,11 +37,16 @@ final class FirebaseTransport extends AbstractTransport
 
     private array $credentials;
 
-    public function __construct(#[\SensitiveParameter] array $credentials, HttpClientInterface $client = null, EventDispatcherInterface $dispatcher = null)
+    public function __construct(
+        #[\SensitiveParameter] array $credentials,
+        HttpClientInterface $client = null,
+        EventDispatcherInterface $dispatcher = null,
+        private AdapterInterface $cache = new FilesystemAdapter(),
+    )
     {
         $this->credentials = $credentials;
         $this->client = $client;
-        $this->setHost(str_replace('project_id', $credentials['project_id'], $this->getDefaultHost()));
+        $this->setHost(str_replace('project_id', $this->credentials['project_id'], $this->getDefaultHost()));
 
         parent::__construct($client, $dispatcher);
     }
@@ -61,17 +71,21 @@ final class FirebaseTransport extends AbstractTransport
 
         // Generate Options
         $options = $message->getOptions()?->toArray() ?? [];
-        if (!$options['token'] && !$options['topic']) {
+        if (!isset($options['token']) && !isset($options['topic'])) {
             throw new InvalidArgumentException(sprintf('The "%s" transport required the "token" or "topic" option to be set.', __CLASS__));
         }
         $options['notification']['body'] = $message->getSubject();
-        $options['data'] ??= [];
+
+        // Remove wrong options
+        unset($options['data']);
 
         // Send
         $response = $this->client->request('POST', $endpoint, [
-            'headers' => ['Authorization' => sprintf('key=%s', $this->getJwtToken()),],
+            'headers' => ['Authorization' => 'Bearer ' . $this->getAccessToken()],
             'json' => array_filter(['message' => $options]),
         ]);
+        dump($endpoint, $options);
+        dump($response->getStatusCode());
 
         try {
             $statusCode = $response->getStatusCode();
@@ -101,24 +115,27 @@ final class FirebaseTransport extends AbstractTransport
         return $sentMessage;
     }
 
-    private function getJwtToken(): string
+    private function getAccessToken(): string
     {
-        $time = time();
-        $payload = [
-            'iss' => $this->credentials['client_email'],
-            'sub' => $this->credentials['client_email'],
-            'aud' => 'https://fcm.googleapis.com/',
-            'iat' => $time,
-            'exp' => $time + 3600,
-            'kid' => $this->credentials['private_key_id'],
-        ];
+        // Check if token is in cache.
+        $accessTokenItem = $this->cache->getItem('firebase_access_token');
+        if (null !== $accessTokenItem->get()) {
+            return $accessTokenItem->get();
+        }
 
-        $header = $this->urlSafeEncode(['alg' => 'RS256', 'typ' => 'JWT']);
-        $payload = $this->urlSafeEncode($payload);
-        openssl_sign($header . '.' . $payload, $signature, openssl_pkey_get_private($this->encodePk($this->credentials['private_key'])), OPENSSL_ALGO_SHA256);
-        $signature = $this->urlSafeEncode($signature);
+        // Get token from Google.
+        $client = new Client();
+        $client->setAuthConfig($this->credentials);
+        $client->addScope('https://www.googleapis.com/auth/firebase.messaging');
+        $client->useApplicationDefaultCredentials();
+        $reponse = $client->fetchAccessTokenWithAssertion();
 
-        return $header . '.' . $payload . '.' . $signature;
+        // Set token in cache.
+        $accessTokenItem->set($reponse['access_token']);
+        $accessTokenItem->expiresAt(new DateTimeImmutable('now + '.($reponse['expires_in'] - 60).' seconds'));
+        $this->cache->save($accessTokenItem);
+
+        return $reponse['access_token'];
     }
 
     protected function urlSafeEncode(string|array $data): string

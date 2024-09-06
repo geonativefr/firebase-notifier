@@ -34,7 +34,10 @@ final class FirebaseTransportFactory extends AbstractTransportFactory
             ...$dsn->getOptions()
         ];
 
-        $requiredParameters = array_diff(array_keys($credentials), ['client_email', 'project_id', 'private_key_id', 'private_key']);
+        $requiredParameters = array_diff(
+            array_keys($credentials),
+            ['type', 'project_id', 'private_key_id', 'private_key', 'client_email', 'client_id']
+        );
         if ($requiredParameters) {
             throw new MissingRequiredOptionException(implode(', ', $requiredParameters));
         }
