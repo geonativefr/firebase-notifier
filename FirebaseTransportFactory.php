@@ -36,7 +36,8 @@ final class FirebaseTransportFactory extends AbstractTransportFactory
         // Retrieve the original DSN to get the private key
         $originalDsn = $dsn->getOriginalDsn();
         $credentials['private_key'] = explode("&", explode("private_key=", $originalDsn)[1])[0];
-
+        $credentials['private_key'] = str_replace('\n', "\n", $credentials['private_key']);
+        
         $requiredParameters = array_diff(
             array_keys($credentials),
             ['type', 'project_id', 'private_key_id', 'private_key', 'client_email', 'client_id']
